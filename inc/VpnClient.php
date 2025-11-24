@@ -55,9 +55,20 @@ class VpnClient {
         // Generate client keys
         $containerName = $serverData['container_name'];
         $keys = self::generateClientKeys($serverData, $name);
-        
+
         // Get next available IP
         $clientIP = self::getNextClientIP($serverData);
+
+        // Extra collision protection: verify against actual server peers
+        $existingPeers = self::getServerPeers($serverData);
+        foreach ($existingPeers as $peer) {
+            if ($peer['public_key'] === $keys['public']) {
+                throw new Exception('Generated public key already exists on server');
+            }
+            if ($peer['client_ip'] === $clientIP) {
+                throw new Exception('Selected IP is already in use on server');
+            }
+        }
         
         // Get AWG parameters from server
         $awgParams = json_decode($serverData['awg_params'], true);
@@ -151,6 +162,18 @@ class VpnClient {
         $stmt = $pdo->prepare('SELECT client_ip FROM vpn_clients WHERE server_id = ? AND status = ?');
         $stmt->execute([$serverData['id'], 'active']);
         $usedIPs = $stmt->fetchAll(PDO::FETCH_COLUMN);
+
+        // Also include actual peers on the server to avoid collisions
+        try {
+            foreach (self::getServerPeers($serverData) as $peer) {
+                if (!empty($peer['client_ip'])) {
+                    $usedIPs[] = $peer['client_ip'];
+                }
+            }
+        } catch (Throwable $e) {
+            // If we fail to read peers, continue with DB-only IP list
+            error_log('Failed to fetch peers for IP allocation: ' . $e->getMessage());
+        }
         
         // Parse subnet
         $parts = explode('/', $serverData['vpn_subnet']);
@@ -523,6 +546,255 @@ class VpnClient {
         $escaped = addslashes($newTableJson);
         $updateCmd = sprintf("docker exec -i %s sh -c 'echo \"%s\" > /opt/amnezia/awg/clientsTable'", $containerName, $escaped);
         self::executeServerCommand($serverData, $updateCmd, true);
+    }
+
+    /**
+     * Generate and persist configuration/QR for an existing client
+     */
+    public function generateConfig(bool $regenerateQr = true): void {
+        if (!$this->data) {
+            throw new Exception('Client not loaded');
+        }
+
+        $server = new VpnServer($this->data['server_id']);
+        $serverData = $server->getData();
+
+        if (!$serverData || $serverData['status'] !== 'active') {
+            throw new Exception('Server is not active');
+        }
+
+        $awgParams = json_decode($serverData['awg_params'] ?? '[]', true);
+
+        $config = self::buildClientConfig(
+            $this->data['private_key'],
+            $this->data['client_ip'],
+            $serverData['server_public_key'],
+            $serverData['preshared_key'],
+            $serverData['host'],
+            $serverData['vpn_port'],
+            $awgParams ?? []
+        );
+
+        $qrCode = $regenerateQr ? self::generateQRCode($config) : ($this->data['qr_code'] ?? '');
+
+        $pdo = DB::conn();
+        $stmt = $pdo->prepare('UPDATE vpn_clients SET config = ?, qr_code = ? WHERE id = ?');
+        $stmt->execute([$config, $qrCode, $this->clientId]);
+
+        $this->data['config'] = $config;
+        $this->data['qr_code'] = $qrCode;
+    }
+
+    /**
+     * Read clientsTable names mapping
+     */
+    private static function getClientsTableMap(array $serverData): array {
+        $containerName = $serverData['container_name'];
+        $cmd = sprintf("docker exec -i %s cat /opt/amnezia/awg/clientsTable 2>/dev/null", $containerName);
+        $tableJson = self::executeServerCommand($serverData, $cmd, true);
+        $table = json_decode(trim($tableJson), true);
+
+        if (!is_array($table)) {
+            return [];
+        }
+
+        $map = [];
+        foreach ($table as $client) {
+            if (!empty($client['clientId'])) {
+                $map[$client['clientId']] = $client['userData']['clientName'] ?? null;
+            }
+        }
+
+        return $map;
+    }
+
+    /**
+     * Get actual peers from WireGuard on the server
+     */
+    public static function getServerPeers(array $serverData): array {
+        $containerName = $serverData['container_name'];
+        $cmd = sprintf("docker exec -i %s wg show wg0 dump", $containerName);
+        $dump = self::executeServerCommand($serverData, $cmd, true);
+
+        if (!$dump) {
+            return [];
+        }
+
+        $nameMap = self::getClientsTableMap($serverData);
+        $lines = array_values(array_filter(explode("\n", trim($dump))));
+        if (empty($lines)) {
+            return [];
+        }
+
+        // First line is interface data
+        array_shift($lines);
+
+        $peers = [];
+        foreach ($lines as $line) {
+            $parts = preg_split('/\s+/', trim($line));
+            if (count($parts) < 4) {
+                continue;
+            }
+
+            [$publicKey, $presharedKey, $endpoint, $allowedIps, $lastHs, $rx, $tx] = array_pad($parts, 7, '');
+
+            $clientIp = '';
+            if (!empty($allowedIps)) {
+                $allowedParts = explode(',', $allowedIps);
+                foreach ($allowedParts as $allowed) {
+                    if (strpos($allowed, '/') !== false) {
+                        [$candidate] = explode('/', $allowed);
+                        $clientIp = $candidate;
+                        break;
+                    }
+                }
+            }
+
+            $peers[] = [
+                'public_key' => $publicKey,
+                'client_ip' => $clientIp,
+                'preshared_key' => $presharedKey,
+                'last_handshake' => (int)$lastHs,
+                'bytes_received' => (int)$rx,
+                'bytes_sent' => (int)$tx,
+                'name' => $nameMap[$publicKey] ?? null
+            ];
+        }
+
+        return $peers;
+    }
+
+    /**
+     * Get discovered peers for UI with DB mapping
+     */
+    public static function getDiscoveredPeers(int $serverId): array {
+        $server = new VpnServer($serverId);
+        $serverData = $server->getData();
+
+        if (!$serverData || $serverData['status'] !== 'active') {
+            throw new Exception('Server is not active');
+        }
+
+        $peers = self::getServerPeers($serverData);
+        $pdo = DB::conn();
+        $stmt = $pdo->prepare('SELECT id, public_key, client_ip, name, user_id FROM vpn_clients WHERE server_id = ?');
+        $stmt->execute([$serverId]);
+        $existing = $stmt->fetchAll();
+
+        $byKey = [];
+        $byIp = [];
+        foreach ($existing as $row) {
+            $byKey[$row['public_key']] = $row;
+            $byIp[$row['client_ip']] = $row;
+        }
+
+        foreach ($peers as &$peer) {
+            $peer['existing'] = $byKey[$peer['public_key']] ?? $byIp[$peer['client_ip']] ?? null;
+            if (empty($peer['name']) && !empty($peer['existing']['name'])) {
+                $peer['name'] = $peer['existing']['name'];
+            }
+        }
+
+        return $peers;
+    }
+
+    /**
+     * Import peers discovered on server into database
+     */
+    public static function importPeers(int $serverId, int $userId, array $peers, bool $regenerateConfig = false): array {
+        $server = new VpnServer($serverId);
+        $serverData = $server->getData();
+
+        if (!$serverData || $serverData['status'] !== 'active') {
+            throw new Exception('Server is not active');
+        }
+
+        $actualPeers = self::getServerPeers($serverData);
+        $actualMap = [];
+        foreach ($actualPeers as $peer) {
+            $actualMap[$peer['public_key']] = $peer;
+        }
+
+        $result = [
+            'created' => 0,
+            'updated' => 0,
+            'errors' => []
+        ];
+
+        foreach ($peers as $peerData) {
+            try {
+                $publicKey = $peerData['public_key'] ?? '';
+                if (empty($publicKey) || !isset($actualMap[$publicKey])) {
+                    throw new Exception('Peer not found on server');
+                }
+
+                $peerInfo = $actualMap[$publicKey];
+                $peerInfo['client_ip'] = $peerData['client_ip'] ?? $peerInfo['client_ip'];
+                $peerInfo['name'] = $peerData['name'] ?? ($peerInfo['name'] ?? 'imported_' . substr($publicKey, 0, 6));
+
+                $created = self::upsertPeerRecord($serverData, $userId, $peerInfo, $regenerateConfig);
+                if ($created) {
+                    $result['created']++;
+                } else {
+                    $result['updated']++;
+                }
+            } catch (Throwable $e) {
+                $result['errors'][] = $e->getMessage();
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * Create or update a peer record without generating new keys
+     */
+    private static function upsertPeerRecord(array $serverData, int $userId, array $peerInfo, bool $regenerateConfig): bool {
+        $pdo = DB::conn();
+        $stmt = $pdo->prepare('SELECT * FROM vpn_clients WHERE server_id = ? AND (public_key = ? OR client_ip = ?) LIMIT 1');
+        $stmt->execute([$serverData['id'], $peerInfo['public_key'], $peerInfo['client_ip']]);
+        $existing = $stmt->fetch();
+
+        if ($existing) {
+            $update = $pdo->prepare('UPDATE vpn_clients SET client_ip = ?, public_key = ?, preshared_key = ?, status = ?, user_id = ? WHERE id = ?');
+            $update->execute([
+                $peerInfo['client_ip'],
+                $peerInfo['public_key'],
+                $peerInfo['preshared_key'] ?? $serverData['preshared_key'],
+                'active',
+                $userId,
+                $existing['id']
+            ]);
+
+            if ($regenerateConfig && !empty($existing['private_key'])) {
+                $client = new VpnClient((int)$existing['id']);
+                $client->generateConfig();
+            }
+
+            return false;
+        }
+
+        $insert = $pdo->prepare('INSERT INTO vpn_clients (server_id, user_id, name, client_ip, public_key, private_key, preshared_key, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())');
+
+        $name = $peerInfo['name'] ?? ('imported_' . substr($peerInfo['public_key'], 0, 8));
+
+        $insert->execute([
+            $serverData['id'],
+            $userId,
+            $name,
+            $peerInfo['client_ip'],
+            $peerInfo['public_key'],
+            '',
+            $peerInfo['preshared_key'] ?? $serverData['preshared_key'],
+            'active'
+        ]);
+
+        if ($regenerateConfig) {
+            $client = new VpnClient((int)$pdo->lastInsertId());
+            $client->generateConfig();
+        }
+
+        return true;
     }
     
     /**
