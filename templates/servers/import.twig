@@ -1,0 +1,36 @@
+{% extends "layout.twig" %}
+{% block title %}Import Server{% endblock %}
+{% block content %}
+<div class="max-w-3xl mx-auto px-4 sm:px-6 lg:px-8">
+  <h1 class="text-3xl font-bold mb-8"><i class="fas fa-file-import text-purple-600"></i> Import Existing Server</h1>
+  {% if error %}<div class="mb-4 bg-red-50 border border-red-400 text-red-700 px-4 py-3 rounded">{{ error }}</div>{% endif %}
+  <form method="POST" class="bg-white shadow rounded-lg p-6 space-y-6">
+    <div><label class="block text-sm font-medium text-gray-700">Server Name</label><input name="name" value="{{ form.name|default('') }}" required class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md" placeholder="Imported Server"></div>
+    <div><label class="block text-sm font-medium text-gray-700">Host IP/Domain</label><input name="host" value="{{ form.host|default('') }}" required class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md" placeholder="123.456.789.0"></div>
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+      <div><label class="block text-sm font-medium text-gray-700">SSH Port</label><input name="port" type="number" value="{{ form.port|default(22) }}" class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md"></div>
+      <div><label class="block text-sm font-medium text-gray-700">SSH Username</label><input name="username" value="{{ form.username|default('root') }}" class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md"></div>
+    </div>
+    <div><label class="block text-sm font-medium text-gray-700">SSH Password</label><input name="password" type="password" required class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md"></div>
+
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+      <div><label class="block text-sm font-medium text-gray-700">Container Name</label><input name="container_name" value="{{ form.container_name|default('amnezia-awg') }}" class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md"></div>
+      <div><label class="block text-sm font-medium text-gray-700">VPN Port</label><input name="vpn_port" value="{{ form.vpn_port|default('') }}" required class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md" placeholder="51820"></div>
+    </div>
+
+    <div><label class="block text-sm font-medium text-gray-700">VPN Subnet</label><input name="vpn_subnet" value="{{ form.vpn_subnet|default('10.8.1.0/24') }}" class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md"></div>
+
+    <div><label class="block text-sm font-medium text-gray-700">Server Public Key</label><textarea name="server_public_key" required rows="2" class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md">{{ form.server_public_key|default('') }}</textarea></div>
+    <div><label class="block text-sm font-medium text-gray-700">Preshared Key</label><textarea name="preshared_key" required rows="2" class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md">{{ form.preshared_key|default('') }}</textarea></div>
+    <div>
+      <label class="block text-sm font-medium text-gray-700">AWG Params (JSON)</label>
+      <textarea name="awg_params" required rows="4" class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md" placeholder='{"Jc":3,"Jmin":10,"Jmax":50,"S1":100,"S2":120,"H1":12345,"H2":23456,"H3":34567,"H4":45678}'>{{ form.awg_params|default('') }}</textarea>
+      <p class="text-xs text-gray-500 mt-1">Values will be validated using provided container without modifying it.</p>
+    </div>
+
+    <button type="submit" class="w-full gradient-bg text-white py-2 px-4 rounded-md hover:opacity-90">
+      <i class="fas fa-save mr-2"></i>Import Server
+    </button>
+  </form>
+</div>
+{% endblock %}

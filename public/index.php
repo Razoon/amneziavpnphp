@@ -251,6 +251,12 @@ Router::get('/servers/create', function () {
     View::render('servers/create.twig');
 });
 
+// Import existing server page
+Router::get('/servers/import', function () {
+    requireAuth();
+    View::render('servers/import.twig');
+});
+
 // Create server action
 Router::post('/servers/create', function () {
     requireAuth();
@@ -298,6 +304,38 @@ Router::post('/servers/create', function () {
     }
 });
 
+// Import existing server action
+Router::post('/servers/import', function () {
+    requireAuth();
+    $user = Auth::user();
+
+    $payload = [
+        'user_id' => $user['id'],
+        'name' => trim($_POST['name'] ?? ''),
+        'host' => trim($_POST['host'] ?? ''),
+        'port' => (int)($_POST['port'] ?? 22),
+        'username' => trim($_POST['username'] ?? 'root'),
+        'password' => $_POST['password'] ?? '',
+        'vpn_port' => trim($_POST['vpn_port'] ?? ''),
+        'vpn_subnet' => trim($_POST['vpn_subnet'] ?? '10.8.1.0/24'),
+        'container_name' => trim($_POST['container_name'] ?? 'amnezia-awg'),
+        'server_public_key' => trim($_POST['server_public_key'] ?? ''),
+        'preshared_key' => trim($_POST['preshared_key'] ?? ''),
+        'awg_params' => $_POST['awg_params'] ?? ''
+    ];
+
+    try {
+        $serverId = VpnServer::importExisting($payload);
+        $_SESSION['success_message'] = 'Server imported and activated';
+        redirect('/servers/' . $serverId);
+    } catch (Exception $e) {
+        View::render('servers/import.twig', [
+            'error' => $e->getMessage(),
+            'form' => $payload
+        ]);
+    }
+});
+
 // Delete server action
 Router::post('/servers/{id}/delete', function ($params) {
     requireAuth();
@@ -332,7 +370,7 @@ Router::get('/servers/{id}/deploy', function ($params) {
     try {
         $server = new VpnServer($serverId);
         $serverData = $server->getData();
-        
+
         // Check ownership
         $user = Auth::user();
         if ($serverData['user_id'] != $user['id'] && !Auth::isAdmin()) {
@@ -340,7 +378,13 @@ Router::get('/servers/{id}/deploy', function ($params) {
             echo 'Forbidden';
             return;
         }
-        
+
+        if (!empty($serverData['is_imported'])) {
+            $_SESSION['error_message'] = 'Imported servers are already managed';
+            redirect('/servers/' . $serverId);
+            return;
+        }
+
         View::render('servers/deploy.twig', ['server' => $serverData]);
     } catch (Exception $e) {
         http_response_code(404);
@@ -366,7 +410,13 @@ Router::post('/servers/{id}/deploy', function ($params) {
             echo json_encode(['error' => 'Forbidden']);
             return;
         }
-        
+
+        if (!empty($serverData['is_imported'])) {
+            http_response_code(400);
+            echo json_encode(['error' => 'Imported servers cannot be deployed']);
+            return;
+        }
+
         $result = $server->deploy();
         echo json_encode($result);
     } catch (Exception $e) {
