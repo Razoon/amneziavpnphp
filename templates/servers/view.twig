@@ -60,6 +60,7 @@
         <div><dt class="text-sm text-gray-600">{{ t('common.status') }}</dt><dd><span class="px-2 py-1 bg-green-100 text-green-800 rounded text-sm">{{ server.status }}</span></dd></div>
         <div><dt class="text-sm text-gray-600">VPN Port</dt><dd>{{ server.vpn_port }}</dd></div>
         <div><dt class="text-sm text-gray-600">Subnet</dt><dd>{{ server.vpn_subnet }}</dd></div>
+        <div><dt class="text-sm text-gray-600">Source</dt><dd>{% if server.is_imported %}<span class="px-2 py-1 bg-blue-100 text-blue-800 rounded text-sm">Imported</span>{% else %}Deployed from panel{% endif %}</dd></div>
       </dl>
       
       {% if server.status == 'active' %}

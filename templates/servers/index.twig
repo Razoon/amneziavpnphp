@@ -33,7 +33,10 @@
 <div class="max-w-7xl mx-auto px-4 py-8">
   <div class="flex justify-between items-center mb-6">
     <h1 class="text-3xl font-bold">{{ t('servers.title') }}</h1>
-    <a href="/servers/create" class="gradient-bg text-white px-4 py-2 rounded"><i class="fas fa-plus"></i> {{ t('servers.add') }}</a>
+    <div class="flex gap-3">
+      <a href="/servers/import" class="px-4 py-2 rounded border border-purple-200 text-purple-700 hover:bg-purple-50"><i class="fas fa-file-import mr-2"></i>Import existing</a>
+      <a href="/servers/create" class="gradient-bg text-white px-4 py-2 rounded"><i class="fas fa-plus"></i> {{ t('servers.add') }}</a>
+    </div>
   </div>
   
   {% if session.success_message %}
@@ -63,7 +66,7 @@
       <tbody>
         {% for server in servers %}
         <tr class="border-t" data-server-id="{{ server.id }}">
-          <td class="px-6 py-4 font-medium">{{ server.name }}</td>
+          <td class="px-6 py-4 font-medium">{{ server.name }} {% if server.is_imported %}<span class="ml-2 px-2 py-1 text-xs bg-blue-100 text-blue-800 rounded">Imported</span>{% endif %}</td>
           <td class="px-6 py-4">{{ server.host }}</td>
           <td class="px-6 py-4">
             <span class="px-2 py-1 bg-{{ server.status == 'active' ? 'green' : 'yellow' }}-100 text-{{ server.status == 'active' ? 'green' : 'yellow' }}-800 rounded text-sm">

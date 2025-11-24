@@ -43,9 +43,9 @@ class VpnServer {
         }
         
         $stmt = $pdo->prepare('
-            INSERT INTO vpn_servers 
-            (user_id, name, host, port, username, password, container_name, vpn_subnet, status) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO vpn_servers
+            (user_id, name, host, port, username, password, container_name, vpn_subnet, status, is_imported)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
         ');
         
         $stmt->execute([
@@ -69,6 +69,10 @@ class VpnServer {
     public function deploy(): array {
         if (!$this->data) {
             throw new Exception('Server not loaded');
+        }
+
+        if (!empty($this->data['is_imported'])) {
+            throw new Exception('Imported servers cannot be deployed');
         }
         
         $pdo = DB::conn();
@@ -147,6 +151,70 @@ class VpnServer {
             throw $e;
         }
     }
+
+    /**
+     * Import existing VPN server without deployment
+     */
+    public static function importExisting(array $data): int {
+        $pdo = DB::conn();
+
+        $required = [
+            'user_id', 'name', 'host', 'port', 'username', 'password',
+            'vpn_port', 'server_public_key', 'preshared_key', 'awg_params'
+        ];
+
+        foreach ($required as $field) {
+            if (!isset($data[$field]) || $data[$field] === '') {
+                throw new Exception("Field {$field} is required for import");
+            }
+        }
+
+        $awgParams = self::normalizeAwgParams($data['awg_params']);
+        $containerName = $data['container_name'] ?? 'amnezia-awg';
+        $vpnSubnet = $data['vpn_subnet'] ?? '10.8.1.0/24';
+        $serverId = null;
+
+        try {
+            $stmt = $pdo->prepare('
+                INSERT INTO vpn_servers
+                (user_id, name, host, port, username, password, container_name, vpn_port, vpn_subnet, server_public_key, preshared_key, awg_params, status, is_imported)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+            ');
+
+            $stmt->execute([
+                $data['user_id'],
+                $data['name'],
+                $data['host'],
+                $data['port'],
+                $data['username'],
+                $data['password'],
+                $containerName,
+                $data['vpn_port'],
+                $vpnSubnet,
+                $data['server_public_key'],
+                $data['preshared_key'],
+                json_encode($awgParams),
+                'deploying'
+            ]);
+
+            $serverId = (int)$pdo->lastInsertId();
+
+            $server = new VpnServer($serverId);
+            $server->verifyImportedServer((int)$data['vpn_port']);
+
+            $pdo->prepare('UPDATE vpn_servers SET status = ?, deployed_at = NOW(), error_message = NULL WHERE id = ?')
+                ->execute(['active', $serverId]);
+
+            return $serverId;
+        } catch (Exception $e) {
+            if ($serverId !== null) {
+                $pdo->prepare('UPDATE vpn_servers SET status = ?, error_message = ? WHERE id = ?')
+                    ->execute(['error', $e->getMessage(), $serverId]);
+            }
+
+            throw $e;
+        }
+    }
     
     /**
      * Test SSH connection to server
@@ -183,6 +251,63 @@ class VpnServer {
         );
         
         return shell_exec($sshCommand) ?? '';
+    }
+
+    /**
+     * Validate imported server connectivity without modifying remote host
+     */
+    private function verifyImportedServer(int $vpnPort): void {
+        if (!$this->testConnection()) {
+            throw new Exception('SSH connection failed');
+        }
+
+        $containerName = $this->data['container_name'];
+
+        $containerCheck = trim($this->executeCommand(
+            "docker ps --format '{{.Names}}' | grep -w '{$containerName}' || true",
+            true
+        ));
+
+        if ($containerCheck === '') {
+            throw new Exception('Container not found on server');
+        }
+
+        $wgOutput = trim($this->executeCommand(
+            "docker exec -i {$containerName} wg show 2>&1",
+            true
+        ));
+
+        if ($wgOutput === '' || stripos($wgOutput, 'No such container') !== false) {
+            throw new Exception('WireGuard is not responding in the container');
+        }
+
+        $portCheck = trim($this->executeCommand(
+            "ss -lun | awk '{print \$4}' | grep -E ':(?:{$vpnPort})( |$)' || true",
+            true
+        ));
+
+        if ($portCheck === '') {
+            throw new Exception('Specified VPN port is not listening');
+        }
+    }
+
+    /**
+     * Normalize AWG params from array or JSON string
+     */
+    private static function normalizeAwgParams($awgParams): array {
+        if (is_string($awgParams)) {
+            $decoded = json_decode($awgParams, true);
+            if ($decoded === null) {
+                throw new Exception('AWG params must be valid JSON or array');
+            }
+            $awgParams = $decoded;
+        }
+
+        if (!is_array($awgParams)) {
+            throw new Exception('AWG params must be provided as array or JSON');
+        }
+
+        return $awgParams;
     }
     
     /**
@@ -426,14 +551,16 @@ BASH;
      * Delete server
      */
     public function delete(): bool {
-        // Stop and remove container
-        try {
-            $containerName = $this->data['container_name'];
-            $this->executeCommand("docker stop {$containerName} 2>/dev/null || true", true);
-            $this->executeCommand("docker rm -fv {$containerName} 2>/dev/null || true", true);
-            $this->executeCommand("rm -rf /opt/amnezia/amnezia-awg", true);
-        } catch (Exception $e) {
-            // Ignore errors during cleanup
+        // Stop and remove container for managed deployments only
+        if (empty($this->data['is_imported'])) {
+            try {
+                $containerName = $this->data['container_name'];
+                $this->executeCommand("docker stop {$containerName} 2>/dev/null || true", true);
+                $this->executeCommand("docker rm -fv {$containerName} 2>/dev/null || true", true);
+                $this->executeCommand("rm -rf /opt/amnezia/amnezia-awg", true);
+            } catch (Exception $e) {
+                // Ignore errors during cleanup
+            }
         }
         
         // Delete from database
