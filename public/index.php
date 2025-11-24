@@ -555,6 +555,120 @@ Router::post('/servers/{id}/clients/create', function ($params) {
     }
 });
 
+// Import existing clients from server peers
+Router::get('/clients/import', function () {
+    requireAuth();
+    $currentUser = Auth::user();
+
+    $servers = Auth::isAdmin()
+        ? VpnServer::listAll()
+        : VpnServer::listByUser($currentUser['id']);
+
+    $pdo = DB::conn();
+    $users = $pdo->query('SELECT id, name, email FROM users ORDER BY name')->fetchAll();
+
+    $selectedServerId = isset($_GET['server_id']) ? (int)$_GET['server_id'] : null;
+    $peers = [];
+    $error = null;
+
+    if ($selectedServerId) {
+        try {
+            $server = new VpnServer($selectedServerId);
+            $serverData = $server->getData();
+
+            if ($serverData['user_id'] != $currentUser['id'] && !Auth::isAdmin()) {
+                throw new Exception('Forbidden');
+            }
+
+            $peers = VpnClient::getDiscoveredPeers($selectedServerId);
+        } catch (Throwable $e) {
+            $error = $e->getMessage();
+        }
+    }
+
+    $data = [
+        'servers' => $servers,
+        'users' => $users,
+        'peers' => $peers,
+        'selected_server' => $selectedServerId,
+        'error' => $error,
+    ];
+
+    if (!empty($_SESSION['import_message'])) {
+        $data['message'] = $_SESSION['import_message'];
+        unset($_SESSION['import_message']);
+    }
+
+    View::render('clients/import.twig', $data);
+});
+
+Router::post('/clients/import', function () {
+    requireAuth();
+
+    $serverId = (int)($_POST['server_id'] ?? 0);
+    $userId = (int)($_POST['user_id'] ?? 0);
+    $selectedPeers = $_POST['selected_peers'] ?? [];
+    $peerNames = $_POST['peer_name'] ?? [];
+    $peerIps = $_POST['peer_ip'] ?? [];
+    $peerKeys = $_POST['peer_key'] ?? [];
+    $regenerate = !empty($_POST['regenerate_configs']);
+
+    $currentUser = Auth::user();
+
+    try {
+        if (!$serverId || !$userId || empty($selectedPeers)) {
+            throw new Exception('Server, user and peers are required');
+        }
+
+        $server = new VpnServer($serverId);
+        $serverData = $server->getData();
+
+        if ($serverData['user_id'] != $currentUser['id'] && !Auth::isAdmin()) {
+            throw new Exception('Forbidden');
+        }
+
+        $pdo = DB::conn();
+        $stmt = $pdo->prepare('SELECT id FROM users WHERE id = ?');
+        $stmt->execute([$userId]);
+        if (!$stmt->fetch()) {
+            throw new Exception('Selected user not found');
+        }
+
+        $peers = [];
+        foreach ($selectedPeers as $peerIdx) {
+            if (!isset($peerKeys[$peerIdx])) {
+                continue;
+            }
+
+            $peers[] = [
+                'public_key' => $peerKeys[$peerIdx],
+                'client_ip' => $peerIps[$peerIdx] ?? '',
+                'name' => trim($peerNames[$peerIdx] ?? ''),
+            ];
+        }
+
+        if (empty($peers)) {
+            throw new Exception('No peers selected for import');
+        }
+
+        $result = VpnClient::importPeers($serverId, $userId, $peers, $regenerate);
+
+        $_SESSION['import_message'] = [
+            'type' => empty($result['errors']) ? 'success' : 'warning',
+            'text' => sprintf('Created %d, updated %d, errors: %d', $result['created'], $result['updated'], count($result['errors'])),
+            'errors' => $result['errors']
+        ];
+
+        redirect('/clients/import?server_id=' . $serverId);
+    } catch (Throwable $e) {
+        $_SESSION['import_message'] = [
+            'type' => 'error',
+            'text' => $e->getMessage()
+        ];
+        redirect('/clients/import?server_id=' . $serverId);
+    }
+});
+
 // View client
 Router::get('/clients/{id}', function ($params) {
     requireAuth();
